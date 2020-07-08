@@ -134,13 +134,15 @@ class CSDataSet(data.Dataset):
         self.files = []
         # for split in ["train", "trainval", "val"]:
         for item in self.img_ids:
-            image_path, label_path = item
+            image_path, label_path,edge_path = item
             name = osp.splitext(osp.basename(label_path))[0]
             img_file = osp.join(self.root, image_path)
             label_file = osp.join(self.root, label_path)
+            edge_path = osp.join(self.root,edge_path)
             self.files.append({
                 "img": img_file,
                 "label": label_file,
+                'edge': edge_path,
                 "name": name
             })
         self.id_to_trainid = {-1: ignore_label, 0: ignore_label, 1: ignore_label, 2: ignore_label,
@@ -154,11 +156,13 @@ class CSDataSet(data.Dataset):
     def __len__(self):
         return len(self.files)
 
-    def generate_scale_label(self, image, label):
+    def generate_scale_label(self, image, label,edge=None):
         f_scale = 0.7 + random.randint(0, 14) / 10.0
         image = cv2.resize(image, None, fx=f_scale, fy=f_scale, interpolation = cv2.INTER_LINEAR)
         label = cv2.resize(label, None, fx=f_scale, fy=f_scale, interpolation = cv2.INTER_NEAREST)
-        return image, label
+        if edge is not None:
+            edge = cv2.resize(edge, None, fx=f_scale, fy=f_scale, interpolation = cv2.INTER_LINEAR)
+        return image, label, edge 
 
     def id2trainId(self, label, reverse=False):
         label_copy = label.copy()
@@ -174,11 +178,13 @@ class CSDataSet(data.Dataset):
         datafiles = self.files[index]
         image = cv2.imread(datafiles["img"], cv2.IMREAD_COLOR)
         label = cv2.imread(datafiles["label"], cv2.IMREAD_GRAYSCALE)
+        edge = cv2.imread(datafiles["edge"], cv2.IMREAD_GRAYSCALE)/255.
+
         label = self.id2trainId(label)
         size = image.shape
         name = datafiles["name"]
         if self.scale:
-            image, label = self.generate_scale_label(image, label)
+            image, label, edge = self.generate_scale_label(image, label, edge)
         image = np.asarray(image, np.float32)
         image -= self.mean
         img_h, img_w = label.shape
@@ -191,8 +197,10 @@ class CSDataSet(data.Dataset):
             label_pad = cv2.copyMakeBorder(label, 0, pad_h, 0, 
                 pad_w, cv2.BORDER_CONSTANT,
                 value=(self.ignore_label,))
+            edge_pad = cv2.copyMakeBorder(edge, 0, pad_h,0,pad_w,cv2.BORDER_CONSTANT,value=(self.ignore_label,))
+
         else:
-            img_pad, label_pad = image, label
+            img_pad, label_pad,edge_pad = image, label,edge
 
         img_h, img_w = label_pad.shape
         h_off = random.randint(0, img_h - self.crop_h)
@@ -200,14 +208,16 @@ class CSDataSet(data.Dataset):
         # roi = cv2.Rect(w_off, h_off, self.crop_w, self.crop_h);
         image = np.asarray(img_pad[h_off : h_off+self.crop_h, w_off : w_off+self.crop_w], np.float32)
         label = np.asarray(label_pad[h_off : h_off+self.crop_h, w_off : w_off+self.crop_w], np.float32)
+        edge = np.asarray(edge_pad[h_off : h_off+self.crop_h, w_off : w_off+self.crop_w], np.float32)
         #image = image[:, :, ::-1]  # change to BGR
         image = image.transpose((2, 0, 1))
         if self.is_mirror:
             flip = np.random.choice(2) * 2 - 1
             image = image[:, :, ::flip]
             label = label[:, ::flip]
-
-        return image.copy(), label.copy(), np.array(size), name
+            edge = edge[:,::flip]
+               
+        return image.copy(), label.copy(), edge[None,:,:,].copy(), np.array(size), name
 
 
 class CSDataTestSet(data.Dataset):

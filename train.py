@@ -17,21 +17,22 @@ import os.path as osp
 import networks
 from dataset.datasets import CSDataSet
 
+import wandb
 import random
 import time
 import logging
 from tensorboardX import SummaryWriter
 from utils.pyt_utils import decode_labels, inv_preprocess, decode_predictions
-from loss.criterion import CriterionDSN, CriterionOhemDSN
+from loss.criterion import CriterionDSN, CriterionOhemDSN, CriterionEdgeWithSeg
 from engine import Engine
 # from utils.encoding import DataParallelModel, DataParallelCriterion
-
+from utils.pyt_utils import Logger
 
 IMG_MEAN = np.array((104.00698793,116.66876762,122.67891434), dtype=np.float32)
 
 BATCH_SIZE = 8
 DATA_DIRECTORY = 'cityscapes'
-DATA_LIST_PATH = './dataset/list/cityscapes/train.lst'
+DATA_LIST_PATH = './dataset/list/citys/train.lst'
 IGNORE_LABEL = 255
 INPUT_SIZE = '769,769'
 LEARNING_RATE = 1e-2
@@ -120,6 +121,9 @@ def get_parser():
                         help="choose the samples with correct probability underthe threshold.")
     parser.add_argument("--ohem-keep", type=int, default=200000,
                         help="choose the samples with correct probability underthe threshold.")
+    parser.add_argument("--with-edge",type=str,default='none')
+    parser.add_argument("--seg-weight",type=str,default='0.4,1,1')
+    parser.add_argument("--edge-weight",type=str,default='1')
     return parser
 
 
@@ -148,7 +152,10 @@ def main():
 
     with Engine(custom_parser=parser) as engine:
         args = parser.parse_args()
-
+        if engine.local_rank==0:
+            wandb.init(project='segmentation')
+            wandb.config.update(args)
+            print(args)
         cudnn.benchmark = True
         seed = args.random_seed
         if engine.distributed:
@@ -167,15 +174,22 @@ def main():
         # config network and criterion
         if args.ohem:
             criterion = CriterionOhemDSN(thresh=args.ohem_thres, min_kept=args.ohem_keep)
+        elif args.with_edge:
+            criterion = CriterionEdgeWithSeg(args.seg_weight,args.edge_weight)
         else:
             criterion = CriterionDSN() #CriterionCrossEntropy()
-
+        
         # model = Res_Deeplab(args.num_classes, criterion=criterion,
         #         pretrained_model=args.restore_from)
         seg_model = eval('networks.' + args.model + '.Seg_Model')(
             num_classes=args.num_classes, criterion=criterion,
             pretrained_model=args.restore_from
         )
+        if hasattr(seg_model, 'config_network'):
+            seg_model.config_network(edge_branch=args.with_edge,seg_branch='full')
+        if engine.local_rank==0:
+            if hasattr(seg_model,'config_logger'):
+                seg_model.config_logger(Logger(IMG_MEAN,ignore_index=255))
         # seg_model.init_weights()
 
         # group weight and config optimizer
@@ -209,14 +223,16 @@ def main():
             for idx in pbar:
                 global_iteration += 1
 
-                images, labels, _, _ = dataloader.next()
+                images, labels, edges, _, _ = dataloader.next()
                 images = images.cuda(non_blocking=True)
                 labels = labels.long().cuda(non_blocking=True)
-
+                edges = edges.cuda(non_blocking=True)
                 optimizer.zero_grad()
                 lr = adjust_learning_rate(optimizer, args.learning_rate, global_iteration-1, args.num_steps, args.power)
-                loss = model(images, labels)
-
+                loss = model(images, labels,edges)
+                if idx % 100==0 and engine.local_rank==0:
+                    model.module.display()
+                    
                 reduce_loss = engine.all_reduce_tensor(loss)
                 loss.backward()
                 optimizer.step()

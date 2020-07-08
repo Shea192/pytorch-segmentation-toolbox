@@ -8,8 +8,10 @@ from collections import OrderedDict, defaultdict
 import torch
 import torch.utils.model_zoo as model_zoo
 import torch.distributed as dist
-
+import numpy as np
 from .logger import get_logger
+from PIL import Image
+import wandb 
 
 logger = get_logger()
 
@@ -162,6 +164,29 @@ def decode_labels(mask, num_images=1, num_classes=21):
                   pixels[k_,j_] = label_colours[k]
       outputs[i] = np.array(img)
     return outputs
+def decode_edge_logits(preds,num_images=1):
+
+    if isinstance(preds,list):
+        vis=[]
+        for pred in preds:
+            vis=vis+decode_predictions((pred[:num_images].sigmoid()>0.5).squeeze(1).long(),num_images=num_images,num_classes=1)
+        return vis 
+    else:
+        preds=(preds[:num_images].sigmoid()>0.5).squeeze(1).long()
+        return decode_predictions(preds,num_images=num_images,num_classes=1)
+
+def decode_edge_labels(edge,num_images=1):
+    return decode_labels(edge.squeeze(1),num_images,1)
+
+def decode_logits(preds,num_images=1,num_classes=21):
+    if isinstance(preds,list):
+        vis=[]
+        for pred in preds:
+            vis=vis+decode_predictions(torch.max(pred[:num_images],1)[1],num_images=num_images,num_classes=num_classes) #n,h,w
+        return vis 
+    else:
+        preds=torch.max(preds[:num_images],1)[1] #n,h,w
+        return decode_predictions(preds,num_images=num_images,num_classes=num_classes)
 
 def decode_predictions(preds, num_images=1, num_classes=21):
     """Decode batch of segmentation masks.
@@ -215,3 +240,86 @@ def inv_preprocess(imgs, num_images, img_mean):
     for i in range(num_images):
         outputs[i] = (np.transpose(imgs[i], (1,2,0)) + img_mean).astype(np.uint8)
     return outputs
+
+def resize(tensor,shape,mode='bilinear'):
+    size=[s for s in tensor.size()]
+    if len(size)==2:
+        size=[1,1]+size
+    elif len(size)==3:
+        size=[1]+size
+    kwargs=dict()
+    if mode=='bilinear':
+        kwargs['align_corners']=True
+    return torch.nn.functional.interpolate(tensor.view(*size),size=shape,mode=mode,**kwargs).squeeze()
+
+labels={
+    'citys':{k:v for k,v in zip(range(20),['raod','sidewalk','building','wall','fence','pole','traffic light','traffic sign','vegetation','terrain','sky','person','rider','car','truck','bus','train','motorcycle','bicycle','ignore'])}
+}
+
+class Logger:
+    def __init__(self,img_mean,img_std=[1,1,1],ignore_index=255,category_set='citys'):
+        self.img_std=np.reshape(np.asarray(img_std),(3,1,1))
+        self.img_mean=np.reshape(np.asarray(img_mean),(3,1,1))
+        self.ignore_index=ignore_index
+        self.labels=labels[category_set]
+        self.global_step=-1
+    def inv_process(self,imgs):
+        '''
+        imgs: Tensor [c,h,w]
+        '''
+        return np.transpose((imgs.data.cpu().numpy()*self.img_std + self.img_mean).astype(np.uint8),(1,2,0))
+
+    def visualize(self,imgs,seg_preds,seg_gts=None,edge_preds=None,edge_gts=None,index=0,global_step=-1):
+
+        assert isinstance(imgs,torch.Tensor)
+        assert isinstance(seg_preds,(list,torch.Tensor))
+        assert (seg_gts is None) or isinstance(seg_gts,torch.Tensor)
+        
+        if global_step<=self.global_step:
+            self.global_step+=1
+        else:
+            self.global_step=global_step
+
+        imgs=self.inv_process(imgs[index].detach())
+        h,w,_=imgs.shape
+        
+        seg_gts=resize(seg_gts[index].detach().float(),(h,w),'nearest')
+
+        seg_gts[seg_gts==self.ignore_index]=len(labels)-1
+        if isinstance(seg_preds,list):
+            seg_preds=[resize(pred[index].detach(),(h,w),'bilinear').max(dim=0)[1] for pred in seg_preds]
+        elif isinstance(seg_preds,torch.Tensor):
+            seg_preds=[resize(seg_preds[index].detach(),(h,w),'bilinear').max(dim=0)[1]]
+        else:
+            raise TypeError('Unknown type for segmentation prediction : ', type(seg_preds))
+
+        masks=dict()
+
+        for i,pred in enumerate(seg_preds):
+            masks['prediction_'+str(i)]={
+                'mask_data':seg_preds[i].cpu().numpy(),
+                'class_labels':self.labels
+            }
+        
+        masks['ground_truth']={
+            'mask_data':seg_gts.long().cpu().numpy(),
+            'class_labels':self.labels
+        }
+
+        seg_img=wandb.Image(imgs,masks=masks,caption='seg')
+        vis=[seg_img]
+        if edge_preds is not None:
+            assert isinstance(edge_preds,(list,torch.Tensor))
+            if isinstance(edge_preds,list):
+                edge_preds=[(255*resize(edge_pred[index].detach(),(h,w)).squeeze(0).sigmoid().cpu().numpy()).astype(np.uint8) for edge_pred in edge_preds]
+            else:
+                edge_preds=[(255*resize(edge_preds[index].detach(),(h,w)).squeeze(0).sigmoid().cpu().numpy()).astype(np.uint8)]
+             
+            if edge_gts is not None:
+                assert isinstance(edge_gts,torch.Tensor) 
+                edge_preds.append((resize(edge_gts[index:(index+1)],(h,w)).cpu().numpy()*255).astype(np.uint8)) 
+            
+            edge_img=wandb.Image(np.concatenate(edge_preds,axis=1)[:,:,None],caption='edge')
+            vis.append(edge_img)
+        #segmentation
+        wandb.log({'image':vis},step=self.global_step) 
